@@ -42,35 +42,3 @@ pub fn disableRawMode(file: std.fs.File) void {
     _ = c.tcsetattr(file.handle, c.TCSAFLUSH, &original_termios);
     in_raw_mode = false;
 }
-
-pub fn printKeyCodes() !void {
-    const stdin = std.fs.File.stdin();
-    const stdout = std.fs.File.stdout();
-
-    var reader_buf: [256]u8 = undefined;
-    var stdin_reader = stdin.reader(&reader_buf);
-
-    var writer_buf: [256]u8 = undefined;
-    var stdout_writer = stdout.writer(&writer_buf);
-
-    var quit_buf: [4]u8 = undefined;
-    @memset(&quit_buf, ' ');
-
-    try stdout_writer.interface.print("Debug mode\nType 'quit' to exit\n", .{});
-    try stdout_writer.interface.flush();
-
-    try enableRawMode(stdin);
-    defer disableRawMode(stdin);
-
-    while (true) {
-        const b = try stdin_reader.interface.takeByte();
-        @memmove(quit_buf[0 .. quit_buf.len - 1], quit_buf[1..]);
-        quit_buf[quit_buf.len - 1] = b;
-
-        if (std.mem.eql(u8, &quit_buf, "quit"))
-            return;
-
-        try stdout_writer.interface.print("'{c}' {x:02} ({d})\r\n", .{ if (std.ascii.isPrint(b)) b else '?', b, b });
-        try stdout_writer.interface.flush();
-    }
-}
