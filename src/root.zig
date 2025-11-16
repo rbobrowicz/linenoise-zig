@@ -6,20 +6,40 @@ const c = @cImport({
 
 var in_raw_mode: bool = false;
 var original_termios: c.termios = undefined;
+var in: std.fs.File = undefined;
+var out: std.fs.File = undefined;
+var inbuf: [16]u8 = undefined;
+var outbuf: [128]u8 = undefined;
+var reader: std.fs.File.Reader = undefined;
+var writer: std.fs.File.Writer = undefined;
 
-pub const LinenoiseError = error{
+pub const Keycodes = enum(u8) { ESC = 27, _ };
+
+pub const Error = error{
     NotATty,
     InvalidEscapeSequence,
 };
 
-pub fn enableRawMode(file: std.fs.File) LinenoiseError!void {
+pub const Options = struct {
+    in: ?std.fs.File = null,
+    out: ?std.fs.File = null,
+};
+
+pub fn init(opts: Options) void {
+    in = opts.in orelse std.fs.File.stdin();
+    out = opts.out orelse std.fs.File.stdout();
+    reader = in.reader(&inbuf);
+    writer = out.writer(&outbuf);
+}
+
+pub fn enableRawMode() Error!void {
     if (in_raw_mode)
         return;
 
-    if (!file.isTty())
+    if (!in.isTty())
         return error.NotATty;
 
-    if (c.tcgetattr(file.handle, &original_termios) == -1)
+    if (c.tcgetattr(in.handle, &original_termios) == -1)
         return error.NotATty;
 
     var raw: c.termios = original_termios;
@@ -30,39 +50,42 @@ pub fn enableRawMode(file: std.fs.File) LinenoiseError!void {
     raw.c_cc[c.VMIN] = 1;
     raw.c_cc[c.VTIME] = 0;
 
-    if (c.tcsetattr(file.handle, c.TCSAFLUSH, &raw) < 0)
+    if (c.tcsetattr(in.handle, c.TCSAFLUSH, &raw) < 0)
         return error.NotATty;
 
     in_raw_mode = true;
 }
 
-pub fn disableRawMode(file: std.fs.File) void {
+pub fn disableRawMode() void {
     if (!in_raw_mode)
         return;
 
-    _ = c.tcsetattr(file.handle, c.TCSAFLUSH, &original_termios);
+    _ = c.tcsetattr(in.handle, c.TCSAFLUSH, &original_termios);
     in_raw_mode = false;
 }
 
-pub const Keycodes = enum(u8) {
-    ESC = 27,
-};
+pub fn print(comptime fmt: []const u8, args: anytype) !void {
+    try writer.interface.print(fmt, args);
+    try writer.interface.flush();
+}
 
-pub fn getCursorPosition(in: *std.Io.Reader, out: *std.Io.Writer) !usize {
+pub fn takeByte() !u8 {
+    return try reader.interface.takeByte();
+}
+
+pub fn getCursorPosition() !usize {
     var arr: [32]u8 = undefined;
     var buf = std.Io.Writer.fixed(&arr);
 
-    _ = try out.write("\x1b[6n");
-    try out.flush();
+    _ = try writer.interface.write("\x1b[6n");
+    try writer.interface.flush();
 
-    const readCount = try in.streamDelimiterLimit(&buf, 'R', .limited(arr.len));
-    const b = try in.takeByte();
+    const readCount = try reader.interface.streamDelimiterLimit(&buf, 'R', .limited(arr.len));
+    const b = try reader.interface.takeByte();
 
-    if (b != 'R')
-        return error.InvalidEscapeSequence;
-
-    if (arr[0] != @intFromEnum(Keycodes.ESC) or arr[1] != '[')
-        return error.InvalidEscapeSequence;
+    if (b != 'R') return error.InvalidEscapeSequence;
+    if (arr[0] != @intFromEnum(Keycodes.ESC)) return error.InvalidEscapeSequence;
+    if (arr[1] != '[') return error.InvalidEscapeSequence;
 
     const positions = arr[2..readCount];
     const semi = std.mem.indexOfScalar(u8, positions, ';') orelse return error.InvalidEscapeSequence;
@@ -70,4 +93,3 @@ pub fn getCursorPosition(in: *std.Io.Reader, out: *std.Io.Writer) !usize {
 
     return try std.fmt.parseInt(usize, col, 10);
 }
-
