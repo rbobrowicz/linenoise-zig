@@ -9,6 +9,7 @@ var original_termios: c.termios = undefined;
 
 pub const LinenoiseError = error{
     NotATty,
+    InvalidEscapeSequence,
 };
 
 pub fn enableRawMode(file: std.fs.File) LinenoiseError!void {
@@ -42,3 +43,31 @@ pub fn disableRawMode(file: std.fs.File) void {
     _ = c.tcsetattr(file.handle, c.TCSAFLUSH, &original_termios);
     in_raw_mode = false;
 }
+
+pub const Keycodes = enum(u8) {
+    ESC = 27,
+};
+
+pub fn getCursorPosition(in: *std.Io.Reader, out: *std.Io.Writer) !usize {
+    var arr: [32]u8 = undefined;
+    var buf = std.Io.Writer.fixed(&arr);
+
+    _ = try out.write("\x1b[6n");
+    try out.flush();
+
+    const readCount = try in.streamDelimiterLimit(&buf, 'R', .limited(arr.len));
+    const b = try in.takeByte();
+
+    if (b != 'R')
+        return error.InvalidEscapeSequence;
+
+    if (arr[0] != @intFromEnum(Keycodes.ESC) or arr[1] != '[')
+        return error.InvalidEscapeSequence;
+
+    const positions = arr[2..readCount];
+    const semi = std.mem.indexOfScalar(u8, positions, ';') orelse return error.InvalidEscapeSequence;
+    const col = positions[semi + 1 ..];
+
+    return try std.fmt.parseInt(usize, col, 10);
+}
+
