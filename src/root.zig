@@ -25,6 +25,8 @@ pub const Options = struct {
     out: ?std.fs.File = null,
 };
 
+/// Initializes the library with the specified options.
+/// Defaults `in` to standard input and `out` to standard output.
 pub fn init(opts: Options) void {
     in = opts.in orelse std.fs.File.stdin();
     out = opts.out orelse std.fs.File.stdout();
@@ -32,15 +34,19 @@ pub fn init(opts: Options) void {
     writer = out.writer(&outbuf);
 }
 
-pub fn enableRawMode() Error!void {
+/// Enable raw mode on the specified input device.
+/// Library users will generally not need to use this manually.
+/// Throws an error if the specified device is not a TTY as determined
+/// by Zig's `std.fs.File.isTty`.
+pub fn enableRawMode() error{NotATty}!void {
     if (in_raw_mode)
         return;
 
     if (!in.isTty())
-        return error.NotATty;
+        return Error.NotATty;
 
     if (c.tcgetattr(in.handle, &original_termios) == -1)
-        return error.NotATty;
+        return Error.NotATty;
 
     var raw: c.termios = original_termios;
     raw.c_iflag &= ~@as(c_uint, c.BRKINT | c.ICRNL | c.INPCK | c.ISTRIP | c.IXON);
@@ -51,11 +57,15 @@ pub fn enableRawMode() Error!void {
     raw.c_cc[c.VTIME] = 0;
 
     if (c.tcsetattr(in.handle, c.TCSAFLUSH, &raw) < 0)
-        return error.NotATty;
+        return Error.NotATty;
 
     in_raw_mode = true;
 }
 
+/// Disables raw mode on the specified input device.
+/// Library users will generally not need to use this manually.
+/// This doesn't throw an error even on failure, as it's probably already too
+/// late to do anything about it.
 pub fn disableRawMode() void {
     if (!in_raw_mode)
         return;
@@ -64,15 +74,25 @@ pub fn disableRawMode() void {
     in_raw_mode = false;
 }
 
+/// Convenience method to print on the specified input device.
+/// This function will automatically flush the write buffer after every print.
+/// If the device is in raw mode you will need to add carriage returns (`\r`)
+/// manually to restore the cursor position back to beginning of the line.
 pub fn print(comptime fmt: []const u8, args: anytype) !void {
     try writer.interface.print(fmt, args);
     try writer.interface.flush();
 }
 
+/// Returns a single byte from the input device.
+/// Does not do any processing on the returned value. Should generally not be
+/// called by library users unless you want to handle your own raw input.
 pub fn takeByte() !u8 {
     return try reader.interface.takeByte();
 }
 
+/// Gets the column position of the cursor.
+/// Assumes the input device is a TTY that understands ANSI escape sequences.
+/// Position is 1-based (returns 1 for leftmost column).
 pub fn getCursorPosition() !usize {
     var arr: [32]u8 = undefined;
     var buf = std.Io.Writer.fixed(&arr);
@@ -83,12 +103,12 @@ pub fn getCursorPosition() !usize {
     const readCount = try reader.interface.streamDelimiterLimit(&buf, 'R', .limited(arr.len));
     const b = try reader.interface.takeByte();
 
-    if (b != 'R') return error.InvalidEscapeSequence;
-    if (arr[0] != @intFromEnum(Keycodes.ESC)) return error.InvalidEscapeSequence;
-    if (arr[1] != '[') return error.InvalidEscapeSequence;
+    if (b != 'R') return Error.InvalidEscapeSequence;
+    if (arr[0] != @intFromEnum(Keycodes.ESC)) return Error.InvalidEscapeSequence;
+    if (arr[1] != '[') return Error.InvalidEscapeSequence;
 
     const positions = arr[2..readCount];
-    const semi = std.mem.indexOfScalar(u8, positions, ';') orelse return error.InvalidEscapeSequence;
+    const semi = std.mem.indexOfScalar(u8, positions, ';') orelse return Error.InvalidEscapeSequence;
     const col = positions[semi + 1 ..];
 
     return try std.fmt.parseInt(usize, col, 10);
