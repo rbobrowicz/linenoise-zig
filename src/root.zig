@@ -2,6 +2,7 @@ const std = @import("std");
 
 const c = @cImport({
     @cInclude("termios.h");
+    @cInclude("sys/ioctl.h");
 });
 
 var in_raw_mode: bool = false;
@@ -83,6 +84,11 @@ pub fn print(comptime fmt: []const u8, args: anytype) !void {
     try writer.interface.flush();
 }
 
+fn write(comptime str: []const u8) !void {
+    _ = try writer.interface.write(str);
+    try writer.interface.flush();
+}
+
 /// Returns a single byte from the input device.
 /// Does not do any processing on the returned value. Should generally not be
 /// called by library users unless you want to handle your own raw input.
@@ -97,8 +103,7 @@ pub fn getCursorPosition() !usize {
     var arr: [32]u8 = undefined;
     var buf = std.Io.Writer.fixed(&arr);
 
-    _ = try writer.interface.write("\x1b[6n");
-    try writer.interface.flush();
+    try write("\x1b[6n");
 
     const readCount = try reader.interface.streamDelimiterLimit(&buf, 'R', .limited(arr.len));
     const b = try reader.interface.takeByte();
@@ -112,4 +117,25 @@ pub fn getCursorPosition() !usize {
     const col = positions[semi + 1 ..];
 
     return try std.fmt.parseInt(usize, col, 10);
+}
+
+/// Gets the count of columns in the terminal.
+/// Assumes the input device is a TTY that understands ANSI escape sequences.
+pub fn getColumns() !usize {
+    // try syscall first
+    var ws: c.winsize = undefined;
+    const ret = c.ioctl(in.handle, c.TIOCGWINSZ, &ws);
+    if (ret == 0 and ws.ws_col > 0)
+        return ws.ws_col;
+
+    // fallback to using cursor position
+    const start = try getCursorPosition();
+    try write("\x1b[999C");
+    const end = try getCursorPosition();
+
+    if (end > start) {
+        try print("\x1b[{d}D", .{end - start});
+    }
+
+    return end;
 }
