@@ -1,4 +1,5 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 
 const c = @cImport({
     @cInclude("termios.h");
@@ -10,11 +11,25 @@ var original_termios: c.termios = undefined;
 var in: std.fs.File = undefined;
 var out: std.fs.File = undefined;
 var inbuf: [16]u8 = undefined;
-var outbuf: [128]u8 = undefined;
+var outbuf: [4096]u8 = undefined;
 var reader: std.fs.File.Reader = undefined;
 var writer: std.fs.File.Writer = undefined;
 
-pub const Keycodes = enum(u8) { ESC = 27, _ };
+pub const Keycode = enum(u8) {
+    CTRL_A = 1,
+    CTRL_B = 2,
+    CTRL_C = 3,
+    CTRL_D = 4,
+    CTRL_E = 5,
+    CTRL_F = 6,
+    CTRL_H = 8,
+    ENTER = 13,
+    CTRL_T = 20,
+    CTRL_W = 23,
+    ESC = 27,
+    BACKSPACE = 127,
+    _,
+};
 
 pub const Error = error{
     NotATty,
@@ -84,7 +99,7 @@ pub fn print(comptime fmt: []const u8, args: anytype) !void {
     try writer.interface.flush();
 }
 
-fn write(comptime str: []const u8) !void {
+fn write(str: []const u8) !void {
     _ = try writer.interface.write(str);
     try writer.interface.flush();
 }
@@ -94,6 +109,13 @@ fn write(comptime str: []const u8) !void {
 /// called by library users unless you want to handle your own raw input.
 pub fn takeByte() !u8 {
     return try reader.interface.takeByte();
+}
+
+/// Returns a single byte from the input device, but doesn't advance the stream.
+/// Does not do any processing on the returned value. Should generally not be
+/// called by library users unless you want to handle your own raw input.
+pub fn peekByte() !u8 {
+    return try reader.interface.peekByte();
 }
 
 /// Gets the column position of the cursor.
@@ -109,7 +131,7 @@ pub fn getCursorPosition() !usize {
     const b = try reader.interface.takeByte();
 
     if (b != 'R') return Error.InvalidEscapeSequence;
-    if (arr[0] != @intFromEnum(Keycodes.ESC)) return Error.InvalidEscapeSequence;
+    if (arr[0] != @intFromEnum(Keycode.ESC)) return Error.InvalidEscapeSequence;
     if (arr[1] != '[') return Error.InvalidEscapeSequence;
 
     const positions = arr[2..readCount];
@@ -138,4 +160,292 @@ pub fn getColumns() !usize {
     }
 
     return end;
+}
+
+pub const Result = union(enum) {
+    /// If user presses Ctrl+c
+    interrupt,
+    /// End of stream or user pressed Ctrl+d
+    eof,
+    line: []u8,
+};
+
+pub fn getLine(gpa: Allocator, prompt: []const u8) !Result {
+    // right now we only support reading from a (sane) TTY
+    if (!in.isTty()) return error.NotImplemented;
+    if (!in.getOrEnableAnsiEscapeSupport()) return error.NotImplemented;
+
+    return getLineTty(gpa, prompt);
+}
+
+const EditState = enum(u8) {
+    start,
+    move_left,
+    move_right,
+    move_word_left,
+    move_word_right,
+    move_start,
+    move_end,
+    move_cursor,
+    delete_forward,
+    delete_backward,
+    delete_word_backward,
+    read_next,
+    seen_esc,
+    escape,
+    escape_one,
+    escape_one_semi,
+    escape_one_semi_five,
+    escape_three,
+};
+
+fn getLineTty(gpa: Allocator, prompt: []const u8) !Result {
+    try enableRawMode();
+    defer disableRawMode();
+
+    // create a buffer that will hold the current line
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(gpa);
+    try buf.ensureTotalCapacity(gpa, 80);
+
+    var cursor: usize = 0;
+
+    // goto is great, actually
+    main: switch (EditState.start) {
+        .start => {
+            // 1. go to beginning of line \r
+            // 2. print prompt {s}
+            // 3. print buffer {s}
+            // 4. erase anything after it \x1b[0K
+            // 5. go to beginning of line \r
+            // 6. move cursor to correct position \x1b[{d}C
+            try print("\r{s}{s}\x1b[0K\r\x1b[{d}C", .{ prompt, buf.items, cursor + prompt.len });
+            continue :main .read_next;
+        },
+        .move_left => {
+            cursor = @max(@as(isize, @intCast(cursor)) - 1, 0);
+            continue :main .move_cursor;
+        },
+        .move_right => {
+            cursor = @min(cursor + 1, buf.items.len);
+            continue :main .move_cursor;
+        },
+        .move_start => {
+            cursor = 0;
+            continue :main .move_cursor;
+        },
+        .move_end => {
+            cursor = buf.items.len;
+            continue :main .move_cursor;
+        },
+        .move_word_left => {
+            if (cursor == 0)
+                continue :main .read_next;
+
+            while (cursor > 0) : (cursor -= 1) {
+                if (buf.items[cursor - 1] != ' ')
+                    break;
+            }
+
+            while (cursor > 0) : (cursor -= 1) {
+                if (buf.items[cursor - 1] == ' ')
+                    break;
+            }
+            continue :main .move_cursor;
+        },
+        .move_word_right => {
+            if (cursor == buf.items.len)
+                continue :main .read_next;
+
+            while (cursor < buf.items.len) : (cursor += 1) {
+                if (buf.items[cursor] != ' ')
+                    break;
+            }
+
+            while (cursor < buf.items.len) : (cursor += 1) {
+                if (buf.items[cursor] == ' ')
+                    break;
+            }
+
+            continue :main .move_cursor;
+        },
+        .delete_forward => {
+            if (cursor < buf.items.len) {
+                _ = buf.orderedRemove(cursor);
+                continue :main .start;
+            }
+            continue :main .read_next;
+        },
+        .delete_backward => {
+            if (cursor == 0)
+                continue :main .read_next;
+
+            if (cursor == buf.items.len) {
+                _ = buf.pop();
+            } else {
+                _ = buf.orderedRemove(cursor - 1);
+            }
+            cursor -= 1;
+            continue :main .start;
+        },
+        .delete_word_backward => {
+            if (cursor == 0)
+                continue :main .read_next;
+
+            if (cursor == buf.items.len) {
+                while (cursor > 0 and buf.items[cursor - 1] == ' ') : (cursor -= 1) {
+                    _ = buf.pop();
+                }
+
+                while (cursor > 0 and buf.items[cursor - 1] != ' ') : (cursor -= 1) {
+                    _ = buf.pop();
+                }
+            } else {
+                while (cursor > 0 and buf.items[cursor - 1] == ' ') : (cursor -= 1) {
+                    _ = buf.orderedRemove(cursor - 1);
+                }
+
+                while (cursor > 0 and buf.items[cursor - 1] != ' ') : (cursor -= 1) {
+                    _ = buf.orderedRemove(cursor - 1);
+                }
+            }
+
+            continue :main .start;
+        },
+        .move_cursor => {
+            try print("\r\x1b[{d}C", .{cursor + prompt.len});
+            continue :main .read_next;
+        },
+        .read_next => {
+            const b = try takeByte();
+
+            switch (@as(Keycode, @enumFromInt(b))) {
+                .CTRL_A => continue :main .move_start,
+                .CTRL_B => continue :main .move_left,
+                .CTRL_C => {
+                    // move to right edge, write ^C and bail
+                    try print("\r\x1b[{d}C^C\r\n", .{buf.items.len + prompt.len});
+                    return .interrupt;
+                },
+                .CTRL_D => {
+                    if (buf.items.len == 0)
+                        return .eof;
+                    continue :main .delete_forward;
+                },
+                .CTRL_E => continue :main .move_end,
+                .CTRL_F => continue :main .move_right,
+                .CTRL_H, .BACKSPACE => continue :main .delete_backward,
+                .CTRL_T => {
+                    // transpose
+                    const len = buf.items.len;
+                    if (len < 2)
+                        continue :main .read_next;
+
+                    if (cursor == len) {
+                        const temp = buf.items[len - 1];
+                        buf.items[len - 1] = buf.items[len - 2];
+                        buf.items[len - 2] = temp;
+                    } else {
+                        const temp = buf.items[cursor - 1];
+                        buf.items[cursor - 1] = buf.items[cursor];
+                        buf.items[cursor] = temp;
+                        cursor += 1;
+                    }
+
+                    continue :main .start;
+                },
+                .CTRL_W => continue :main .delete_word_backward,
+                .ENTER => {
+                    try write("\r\n");
+
+                    // return the line
+                    const new_mem = try gpa.alloc(u8, buf.items.len);
+                    @memcpy(new_mem, buf.items);
+                    return .{ .line = new_mem };
+                },
+                .ESC => continue :main .seen_esc,
+                else => {
+                    // skip unrecognied control characters
+                    if (std.ascii.isControl(b))
+                        continue :main .read_next;
+
+                    try buf.insert(gpa, cursor, b);
+                    cursor += 1;
+                    continue :main .start;
+                },
+            }
+        },
+        .seen_esc => {
+            const b = try peekByte();
+            switch (b) {
+                '[' => {
+                    _ = try takeByte();
+                    continue :main .escape;
+                },
+                else => continue :main .read_next,
+            }
+        },
+        .escape => {
+            const b = try takeByte();
+            switch (b) {
+                '1' => continue :main .escape_one,
+                '3' => continue :main .escape_three,
+                'D' => continue :main .move_left, // left arrow
+                'C' => continue :main .move_right, // right arrow
+                'H' => continue :main .move_start, // home
+                'F' => continue :main .move_end, // end
+                else => {
+                    // unhandled escape, add it to the line
+                    try buf.insertSlice(gpa, cursor, &.{ '[', b });
+                    cursor += 2;
+                    continue :main .start;
+                },
+            }
+        },
+        .escape_one => {
+            const b = try takeByte();
+            switch (b) {
+                ';' => continue :main .escape_one_semi,
+                else => {
+                    try buf.insertSlice(gpa, cursor, &.{ '[', '1', b });
+                    cursor += 3;
+                    continue :main .start;
+                },
+            }
+        },
+        .escape_one_semi => {
+            const b = try takeByte();
+            switch (b) {
+                '5' => continue :main .escape_one_semi_five,
+                else => {
+                    try buf.insertSlice(gpa, cursor, &.{ '[', '1', ';', b });
+                    cursor += 4;
+                    continue :main .start;
+                },
+            }
+        },
+        .escape_one_semi_five => {
+            const b = try takeByte();
+            switch (b) {
+                'C' => continue :main .move_word_right, // ctrl + right arrow
+                'D' => continue :main .move_word_left, // ctrl + left arrow
+                else => {
+                    try buf.insertSlice(gpa, cursor, &.{ '[', '1', ';', '5', b });
+                    cursor += 5;
+                    continue :main .start;
+                },
+            }
+        },
+        .escape_three => {
+            const b = try takeByte();
+            switch (b) {
+                '~' => continue :main .delete_forward, // delete
+                else => {
+                    try buf.insertSlice(gpa, cursor, &.{ '[', '3', b });
+                    cursor += 3;
+                    continue :main .start;
+                },
+            }
+        },
+    }
 }

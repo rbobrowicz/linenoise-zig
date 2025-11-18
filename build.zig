@@ -23,15 +23,26 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const demo_exe = b.addExecutable(.{ .name = "demo", .root_module = b.createModule(.{ .root_source_file = b.path("src/demo.zig"), .target = target, .optimize = optimize, .imports = &.{
+        .{ .name = "linenoise", .module = mod },
+    } }) });
+
     b.installArtifact(keycode_exe);
+    b.installArtifact(demo_exe);
 
     const run_keycode_print_step = b.step("keycode-print", "Run keycode printer");
     const run_keycode_print_cmd = b.addRunArtifact(keycode_exe);
     run_keycode_print_step.dependOn(&run_keycode_print_cmd.step);
     run_keycode_print_cmd.step.dependOn(b.getInstallStep());
 
+    const run_demo_step = b.step("demo", "Run demo");
+    const run_demo_cmd = b.addRunArtifact(demo_exe);
+    run_demo_step.dependOn(&run_demo_cmd.step);
+    run_demo_cmd.step.dependOn(b.getInstallStep());
+
     if (b.args) |args| {
         run_keycode_print_cmd.addArgs(args);
+        run_demo_cmd.addArgs(args);
     }
 
     const mod_tests = b.addTest(.{
