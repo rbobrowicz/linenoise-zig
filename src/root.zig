@@ -1,16 +1,15 @@
 const std = @import("std");
 const uni = std.unicode;
+const termios = std.c.termios;
 const Allocator = std.mem.Allocator;
 
 const c = @cImport({
-    @cInclude("termios.h");
-    @cInclude("sys/ioctl.h");
-    @cDefine("__USE_XOPEN", "1"); // for wcwidth
+    @cDefine("_XOPEN_SOURCE", {}); // for wcwidth
     @cInclude("wchar.h");
 });
 
 var in_raw_mode: bool = false;
-var original_termios: c.termios = undefined;
+var original_termios: termios = undefined;
 var in: std.fs.File = undefined;
 var out: std.fs.File = undefined;
 var inbuf: [16]u8 = undefined;
@@ -64,18 +63,25 @@ pub fn enableRawMode() error{NotATty}!void {
     if (!in.isTty())
         return Error.NotATty;
 
-    if (c.tcgetattr(in.handle, &original_termios) == -1)
+    if (std.c.tcgetattr(in.handle, &original_termios) == -1)
         return Error.NotATty;
 
-    var raw: c.termios = original_termios;
-    raw.c_iflag &= ~@as(c_uint, c.BRKINT | c.ICRNL | c.INPCK | c.ISTRIP | c.IXON);
-    raw.c_oflag &= ~@as(c_uint, c.OPOST);
-    raw.c_cflag |= @as(c_uint, c.CS8);
-    raw.c_lflag &= ~@as(c_uint, c.ECHO | c.ICANON | c.IEXTEN | c.ISIG);
-    raw.c_cc[c.VMIN] = 1;
-    raw.c_cc[c.VTIME] = 0;
+    var raw = original_termios;
+    raw.iflag.BRKINT = false;
+    raw.iflag.ICRNL = false;
+    raw.iflag.INPCK = false;
+    raw.iflag.ISTRIP = false;
+    raw.iflag.IXON = false;
+    raw.oflag.OPOST = false;
+    raw.cflag.CSIZE = .CS8;
+    raw.lflag.ECHO = false;
+    raw.lflag.ICANON = false;
+    raw.lflag.IEXTEN = false;
+    raw.lflag.ISIG = false;
+    raw.cc[@intFromEnum(std.c.V.MIN)] = 1;
+    raw.cc[@intFromEnum(std.c.V.TIME)] = 0;
 
-    if (c.tcsetattr(in.handle, c.TCSAFLUSH, &raw) < 0)
+    if (std.c.tcsetattr(in.handle, .FLUSH, &raw) < 0)
         return Error.NotATty;
 
     in_raw_mode = true;
@@ -89,7 +95,7 @@ pub fn disableRawMode() void {
     if (!in_raw_mode)
         return;
 
-    _ = c.tcsetattr(in.handle, c.TCSAFLUSH, &original_termios);
+    _ = std.c.tcsetattr(in.handle, .FLUSH, &original_termios);
     in_raw_mode = false;
 }
 
@@ -464,6 +470,7 @@ fn getStringTerminalWidth(str: []const u8) !usize {
     while (i < str.len) {
         const seqLen = try uni.utf8ByteSequenceLength(str[i]);
         var char: c_int = undefined;
+
         switch (seqLen) {
             1 => {
                 width += 1;
