@@ -23,9 +23,19 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    const demo_exe = b.addExecutable(.{ .name = "demo", .root_module = b.createModule(.{ .root_source_file = b.path("src/demo.zig"), .target = target, .optimize = optimize, .imports = &.{
-        .{ .name = "linenoise", .module = mod },
-    } }) });
+    const demo_exe = b.addExecutable(.{
+        .name = "demo",
+        .root_module = b.createModule(
+            .{
+                .root_source_file = b.path("src/demo.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "linenoise", .module = mod },
+                },
+            },
+        ),
+    });
 
     b.installArtifact(keycode_exe);
     b.installArtifact(demo_exe);

@@ -10,7 +10,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     while (true) {
-        const res = try linenoise.getLine(allocator, "test>");
+        const res = try linenoise.getLine(allocator, "おはよう>");
 
         switch (res) {
             .eof => break,

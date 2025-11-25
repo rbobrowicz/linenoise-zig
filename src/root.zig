@@ -1,9 +1,12 @@
 const std = @import("std");
+const uni = std.unicode;
 const Allocator = std.mem.Allocator;
 
 const c = @cImport({
     @cInclude("termios.h");
     @cInclude("sys/ioctl.h");
+    @cDefine("__USE_XOPEN", "1"); // for wcwidth
+    @cInclude("wchar.h");
 });
 
 var in_raw_mode: bool = false;
@@ -203,12 +206,17 @@ fn getLineTty(gpa: Allocator, prompt: []const u8) !Result {
     try enableRawMode();
     defer disableRawMode();
 
+    // to get wcwidth to work
+    const current_locale = std.c.setlocale(.CTYPE, "");
+    defer _ = std.c.setlocale(.CTYPE, current_locale);
+
     // create a buffer that will hold the current line
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(gpa);
     try buf.ensureTotalCapacity(gpa, 80);
 
     var cursor: usize = 0;
+    const promptLen = try getStringTerminalWidth(prompt);
 
     // goto is great, actually
     main: switch (EditState.start) {
@@ -219,7 +227,7 @@ fn getLineTty(gpa: Allocator, prompt: []const u8) !Result {
             // 4. erase anything after it \x1b[0K
             // 5. go to beginning of line \r
             // 6. move cursor to correct position \x1b[{d}C
-            try print("\r{s}{s}\x1b[0K\r\x1b[{d}C", .{ prompt, buf.items, cursor + prompt.len });
+            try print("\r{s}{s}\x1b[0K\r\x1b[{d}C", .{ prompt, buf.items, cursor + promptLen });
             continue :main .read_next;
         },
         .move_left => {
@@ -313,7 +321,7 @@ fn getLineTty(gpa: Allocator, prompt: []const u8) !Result {
             continue :main .start;
         },
         .move_cursor => {
-            try print("\r\x1b[{d}C", .{cursor + prompt.len});
+            try print("\r\x1b[{d}C", .{cursor + promptLen});
             continue :main .read_next;
         },
         .read_next => {
@@ -324,7 +332,7 @@ fn getLineTty(gpa: Allocator, prompt: []const u8) !Result {
                 .CTRL_B => continue :main .move_left,
                 .CTRL_C => {
                     // move to right edge, write ^C and bail
-                    try print("\r\x1b[{d}C^C\r\n", .{buf.items.len + prompt.len});
+                    try print("\r\x1b[{d}C^C\r\n", .{buf.items.len + promptLen});
                     return .interrupt;
                 },
                 .CTRL_D => {
@@ -448,4 +456,37 @@ fn getLineTty(gpa: Allocator, prompt: []const u8) !Result {
             }
         },
     }
+}
+
+fn getStringTerminalWidth(str: []const u8) !usize {
+    var width: usize = 0;
+    var i: usize = 0;
+    while (i < str.len) {
+        const seqLen = try uni.utf8ByteSequenceLength(str[i]);
+        var char: c_int = undefined;
+        switch (seqLen) {
+            1 => {
+                width += 1;
+                i += 1;
+                continue;
+            },
+            2 => {
+                char = try uni.utf8Decode2(.{ str[i], str[i + 1] });
+            },
+            3 => {
+                char = try uni.utf8Decode3(.{ str[i], str[i + 1], str[i + 2] });
+            },
+            4 => {
+                char = try uni.utf8Decode4(.{ str[i], str[i + 1], str[i + 2], str[i + 3] });
+            },
+            else => unreachable,
+        }
+
+        const cols = c.wcwidth(char);
+        if (cols < 0) return error.InvalidCharacter;
+
+        width += @intCast(cols);
+        i += seqLen;
+    }
+    return width;
 }
